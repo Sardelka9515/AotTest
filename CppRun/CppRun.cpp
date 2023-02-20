@@ -8,11 +8,13 @@
 #include <winternl.h>	
 #include <MinHook.h>
 #include <string>
+#include <map>
+#include <vector>
 
 using namespace std;
 
 typedef NTSTATUS(WINAPI* pNtQIT)(HANDLE, LONG, PVOID, ULONG, PULONG);
-
+#define _WIN32_WINNT 0x0500 
 #define STATUS_SUCCESS    ((NTSTATUS)0x00000000L)
 #define ThreadQuerySetWin32StartAddress 9
 #define NativeAOT
@@ -23,11 +25,15 @@ const LPCSTR EntryPoint = "Hello";
 const LPCWSTR DllName = L"CppDll.dll";
 const LPCSTR EntryPoint = "?Hello@@YAXXZ";
 #endif
+
 template<class C, typename T>
 bool contains(C&& c, T e) { return find(begin(c), end(c), e) != end(c); };
 
+map<PVOID, PVECTORED_EXCEPTION_HANDLER> VectoredExceptionHandlers;
+
 DWORD FlsAllocIndecies[256] = { 0 };
 int FlsCount = 0;
+HMODULE AotModule;
 
 #pragma region HOOK PROC
 
@@ -64,6 +70,19 @@ DWORD FlsAllocHook(PFLS_CALLBACK_FUNCTION lpCallback) {
 	return FlsAllocIndecies[FlsCount++] = FlsAllocOrg(lpCallback);
 }
 
+typedef PVOID(WINAPI* ADDVECEXHAND)(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler);
+ADDVECEXHAND AddVecExHandOrg = NULL;
+PVOID AddVectoredExceptionHandlerHook(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler)
+{
+	HMODULE module;
+	GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)Handler, &module);
+	auto hHandler = AddVecExHandOrg(First, Handler);
+	cout << "Exception handler registered: " << (LPVOID)Handler;
+	cout << ", module: " << module;
+	cout << ", handle: " << hHandler << endl;
+	VectoredExceptionHandlers[hHandler] = Handler;
+	return hHandler;
+}
 #pragma endregion
 
 LPVOID WINAPI GetThreadStartAddress(HANDLE hThread)
@@ -167,8 +186,6 @@ int main()
 	{
 		return 1;
 	}
-	// cout << MH_CreateHook(&CreateThreadpool, &CreateThreadPoolHook, (LPVOID*)&CreateThreadpoolOrg) << endl;
-	// cout << MH_EnableHook(&CreateThreadpool) << endl;
 
 	// Not required, just notify when .NET created a thread
 	cout << MH_CreateHook(&CreateThread, &CreateThreadHook, (LPVOID*)&CreateThreadOrg) << endl;
@@ -182,32 +199,30 @@ int main()
 	cout << MH_CreateHook(&FlsAlloc, &FlsAllocHook, (LPVOID*)&FlsAllocOrg) << endl;
 	cout << MH_EnableHook(&FlsAlloc) << endl;
 
+	cout << MH_CreateHook(&AddVectoredExceptionHandler, &AddVectoredExceptionHandlerHook, (LPVOID*)&AddVecExHandOrg) << endl;
+	cout << MH_EnableHook(&AddVectoredExceptionHandler) << endl;
+
 
 	cout << "Process module is " << GetModuleHandle(NULL) << endl;
-	// DWORD threadsBefore[256] = { 0 };
-	// DWORD threadsAfter[sizeof(threadsBefore)] = { 0 };
-	// cout << "Current threads" << endl;
-	// ListProcessThreads(GetCurrentProcessId(), threadsBefore);
 	cout << "press enter to load module" << endl;
 	cin.ignore();
 
 load:
 	FlsCount = 0;
-	HMODULE module = LoadLibraryW(DllName);
-	if (module == NULL) {
+	AotModule = LoadLibraryW(DllName);
+	if (AotModule == NULL) {
 		cout << "Invalid dll" << endl;
 		return -1;
 	}
 
-	cout << "Module loaded: " << module << endl;
+	cout << "Module loaded: " << AotModule << endl;
 
-	auto proc = GetProcAddress(module, EntryPoint);
+	auto proc = GetProcAddress(AotModule, EntryPoint);
 	if (proc == NULL) {
 		cout << "Invalid entry point" << endl;
 		return -1;
 	}
 	proc();
-
 	// cout << "Threads" << endl;
 	// ListProcessThreads(GetCurrentProcessId(), threadsAfter);
 	cout << "Press enter to unload" << endl;
@@ -220,18 +235,48 @@ load:
 		cout << "Freeing Fls " << FlsAllocIndecies[i] << " : " << (FlsFree(FlsAllocIndecies[i]) ? "Success" : "Fail") << endl;
 	}
 
+	// Search for handlers to unregister
+	map<PVOID, PVECTORED_EXCEPTION_HANDLER> toUnregister;
+	for (const auto& pair : VectoredExceptionHandlers) {
+		HMODULE module;
+		GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)pair.second, &module);
+		if (module == AotModule) {
+			toUnregister[pair.first] = pair.second;
+		}
+	}
+
+
 retry:
-	if (!FreeLibrary(module)) {
+	if (!FreeLibrary(AotModule)) {
 		cout << "Failed to unload module: " << GetLastError() << endl;
 		return -1;
 	}
-	if (module = GetModuleHandle(DllName)) {
+	if (AotModule = GetModuleHandle(DllName)) {
 		Sleep(20);
 		cout << "Module not unloaded, retrying..." << endl;
 		goto retry;
 	}
 
+	// Remove exception handlers
+	for (const auto& pair : toUnregister) {
+		bool fSuccess = RemoveVectoredExceptionHandler(pair.first);
+		if (fSuccess) {
+			cout << "Removed exception handler: " << pair.second << endl;
+		}
+		else {
+			cout << "Failed to remove exception handler: " << pair.second << endl;
+			cout << "Error: " << GetLastError() << endl;
+		}
+	}
+
 	cout << "Unloaded module!" << endl;
+	try {
+		throw exception("argh");
+	}
+	catch (exception ex) {
+		cout << "caught" << endl; // Handler never called
+	}
+
 	cout << "press enter to load again, type \"exit\" to quit" << endl;
 	string response;
 	getline(cin, response);

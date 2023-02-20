@@ -5,7 +5,12 @@
 #define DllExport   __declspec( dllexport )
 using namespace std;
 DllExport void Hello() {
-    cout << "hello from cpp dll!\n";
+    try {
+        cout << "hello from cpp dll!\n";
+    }
+    catch(exception ex){
+        cout << "stuff\n";
+    }
 }
 DWORD Init(LPVOID lparam) {
     while (true) {
